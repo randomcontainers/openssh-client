@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+RUN apk add --no-cache gpgv
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${VERSION}.tar.gz /src/
+ADD https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${VERSION}.tar.gz.asc /src/
+# OpenSSH release signing key (Damien Miller), fingerprint
+# 7168 B983 815A 5EEF 59A4 ADFD 2A3F 414E 7360 60BA. A release signed with
+# another key fails here until that key is added.
+COPY keys/openssh-release.gpg /tmp/openssh-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/openssh-release.gpg "openssh-${VERSION}.tar.gz.asc" "openssh-${VERSION}.tar.gz"; \
+    mkdir openssh; \
+    tar -xzf "openssh-${VERSION}.tar.gz" -C openssh --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      libedit-dev \
+      linux-headers \
+      openssl-dev \
+      pkgconf \
+      scanelf \
+      zlib-dev
+COPY --link --from=source /src/openssh /src/openssh
+WORKDIR /src/openssh
+ARG JOBS
+# Only the client programs and the helpers they start are built: no sshd,
+# sshd-session, sshd-auth or ssh-keysign. configure leaves out what it cannot
+# find without failing, so config.h is checked. The programs go to
+# libexec/openssh/bin; /usr/local/bin has links to wrapper.sh, which starts
+# them under any UID.
+RUN --mount=type=bind,source=wrapper.sh,target=/tmp/wrapper.sh \
+    set -eu; \
+    ./configure \
+      --prefix=/usr/local \
+      --sysconfdir=/etc/ssh \
+      --libexecdir=/usr/local/libexec/openssh \
+      --with-libedit \
+      --without-security-key-builtin \
+      --disable-utmp \
+      --disable-wtmp \
+      --disable-lastlog; \
+    for define in WITH_OPENSSL WITH_ZLIB USE_LIBEDIT ENABLE_PKCS11 ENABLE_SK; do \
+      grep -Eq "^#define ${define}( |\$)" config.h || { echo "configure turned off ${define}" >&2; exit 1; }; \
+    done; \
+    if grep -Eq '^#define (ENABLE_SK_INTERNAL|USE_PAM|GSSAPI|KRB5)( |$)' config.h; then \
+      echo "configure turned on built-in FIDO, PAM or Kerberos support" >&2; \
+      exit 1; \
+    fi; \
+    make -j"${JOBS:-$(nproc)}" \
+      ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan \
+      sftp-server ssh-pkcs11-helper ssh-sk-helper; \
+    libexec=/out/usr/local/libexec/openssh; \
+    install -d /out/usr/local/bin "$libexec/bin"; \
+    install -m 755 ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan "$libexec/bin/"; \
+    install -m 755 sftp-server ssh-pkcs11-helper ssh-sk-helper "$libexec/"; \
+    strip --strip-unneeded "$libexec"/bin/* "$libexec/sftp-server" "$libexec/ssh-pkcs11-helper" "$libexec/ssh-sk-helper"; \
+    install -m 755 /tmp/wrapper.sh "$libexec/wrapper"; \
+    for tool in ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan; do \
+      ln -s ../libexec/openssh/wrapper "/out/usr/local/bin/${tool}"; \
+    done
+
+ARG BASE_IMAGE
+ARG VERSION
+# runtime-deps lists the so: names the binaries need, minus the libraries
+# built here, plus the packages in runtime-deps.alpine.
+# The ML-KEM and ML-DSA code compiled into every program is Cryspen's libcrux,
+# under the MIT license, which LICENCE does not cover; its notice and copyright
+# lines are copied as well. wrapper.sh comes from this repository, so the
+# repository's LICENSE goes with it.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=LICENSE,target=/tmp/LICENSE.wrapper \
+    set -eu; \
+    printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+p[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    meta=/out/usr/local/share/randomcontainers/openssh-client; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENCE "$meta/licenses/"; \
+    cp /tmp/LICENSE.wrapper "$meta/licenses/LICENSE.wrapper"; \
+    { \
+      sed -n '/^ \* MIT License$/,/^ \*\/$/p' libcrux_internal.h; \
+      echo; \
+      grep 'SPDX-FileCopyrightText' libcrux_internal.h | sort -u; \
+    } > "$meta/licenses/LICENSE.libcrux"; \
+    grep -q 'Copyright (c) .* Cryspen' "$meta/licenses/LICENSE.libcrux"; \
+    grep -q 'SPDX-FileCopyrightText: .* Cryspen Sarl' "$meta/licenses/LICENSE.libcrux"; \
+    grep -q 'Permission is hereby granted' "$meta/licenses/LICENSE.libcrux"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${VERSION}.tar.gz" \
+      "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${VERSION}.tar.gz.asc" \
+      "https://github.com/randomcontainers/openssh-client/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    /out/usr/local/libexec/openssh/bin/ssh -V 2> /tmp/ssh-version; \
+    if ! head -n 1 /tmp/ssh-version | grep -Fq "OpenSSH_${VERSION}, OpenSSL "; then \
+      cat /tmp/ssh-version >&2; \
+      exit 1; \
+    fi; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      sed -n 's/^  \$ \(\.\/configure.*\)/\1/p' config.log; \
+      cat /tmp/ssh-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /usr/local/share/randomcontainers/openssh-client/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "ssh"]
+CMD ["-V"]

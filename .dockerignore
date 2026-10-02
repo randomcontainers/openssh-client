@@ -1,5 +1,6 @@
 *
 !LICENSE
 !keys/openssh-release.gpg
+!runtime-deps.alpine
 !runtime-deps.ubuntu
 !wrapper.sh
