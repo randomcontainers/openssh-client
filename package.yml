@@ -1,0 +1,181 @@
+name: openssh-client
+title: OpenSSH client
+summary: Logs in to SSH servers and copies files with scp and sftp; creates and manages keys with ssh-keygen, ssh-agent and ssh-add.
+homepage: https://www.openssh.com/
+license: SSH-OpenSSH AND MIT
+source-release: true
+upstream:
+  source: github-tag
+  repository: openssh/openssh-portable
+  # Release tags look like V_10_5_P1. loose compares 5p1 as text, so a 10.10p1
+  # would sort below 10.9p1; OpenSSH has always followed x.9 with x+1.0.
+  tag-pattern: '^V_(\d+)_(\d+)_P(\d+)$'
+  version-template: '{1}.{2}p{3}'
+  versioning: loose
+  version: "10.5p1"
+  # Most releases fix security issues, and the tarball is published with the tag.
+  cooldown: 2h
+  artifact:
+    url: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-{version}.tar.gz
+    signature: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-{version}.tar.gz.asc
+    sha256: d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11
+image:
+  entrypoint: [ssh]
+  cmd: [-V]
+test:
+  - |
+    ssh -V 2> version.txt || { cat version.txt >&2; exit 1; }
+    if ! grep -Eq "^OpenSSH_${VERSION}, OpenSSL " version.txt; then
+      echo "expected OpenSSH_${VERSION} built with OpenSSL, got:" >&2
+      cat version.txt >&2
+      exit 1
+    fi
+    for tool in ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan; do
+      target="$(readlink -f "/usr/local/bin/$tool")"
+      if [ "$target" != /usr/local/libexec/openssh/wrapper ]; then
+        echo "/usr/local/bin/$tool points to $target" >&2
+        exit 1
+      fi
+    done
+    # Without the wrapper, ssh refuses to start for a UID that has no passwd
+    # entry, such as the UID these tests run as.
+    if ! getent passwd "$(id -u)" > /dev/null; then
+      if /usr/local/libexec/openssh/bin/ssh -V 2> unwrapped.txt; then
+        echo "ssh started without a passwd entry, so the wrapper went untested" >&2
+        exit 1
+      fi
+      if ! grep -Fq "No user exists for uid $(id -u)" unwrapped.txt; then
+        cat unwrapped.txt >&2
+        exit 1
+      fi
+    fi
+    for f in /usr/local/sbin/sshd /usr/local/libexec/openssh/sshd-session \
+      /usr/local/libexec/openssh/sshd-auth /usr/local/libexec/openssh/ssh-keysign; do
+      if [ -e "$f" ]; then echo "$f is in the image" >&2; exit 1; fi
+    done
+  - |
+    ssh -G -p 2222 -l bob example.test > config.txt
+    for line in 'hostname example.test' 'user bob' 'port 2222'; do
+      if ! grep -Fxq "$line" config.txt; then
+        echo "ssh -G did not print '$line':" >&2
+        cat config.txt >&2
+        exit 1
+      fi
+    done
+    ssh -Q kex > kex.txt
+    ssh -Q key > key.txt
+    ssh -Q cipher > cipher.txt
+    for check in kex.txt:mlkem768x25519-sha256 kex.txt:sntrup761x25519-sha512 \
+      key.txt:ssh-ed25519 key.txt:sk-ssh-ed25519@openssh.com \
+      cipher.txt:chacha20-poly1305@openssh.com; do
+      if ! grep -Fxq "${check#*:}" "${check%%:*}"; then
+        echo "${check%%:*} does not list ${check#*:}" >&2
+        exit 1
+      fi
+    done
+    if grep -Fxq ssh-dss key.txt; then echo "ssh -Q key lists ssh-dss" >&2; exit 1; fi
+  - |
+    mkdir keygen
+    cd keygen || exit 1
+    ssh-keygen -q -t ed25519 -N '' -C test -f id_ed25519
+    ssh-keygen -q -t ecdsa -b 521 -N '' -C test -f id_ecdsa
+    ssh-keygen -q -t rsa -b 3072 -N '' -C test -f id_rsa
+    for k in id_ed25519 id_ecdsa id_rsa; do
+      ssh-keygen -y -f "$k" > "$k.derived"
+      if [ "$(cut -d ' ' -f 1,2 "$k.derived")" != "$(cut -d ' ' -f 1,2 "$k.pub")" ]; then
+        echo "ssh-keygen -y -f $k does not match $k.pub" >&2
+        cat "$k.derived" "$k.pub" >&2
+        exit 1
+      fi
+    done
+    if ! grep -q '^ecdsa-sha2-nistp521 ' id_ecdsa.pub; then cat id_ecdsa.pub >&2; exit 1; fi
+    ssh-keygen -l -f id_rsa.pub > rsa-bits.txt
+    if ! grep -q '^3072 ' rsa-bits.txt; then cat rsa-bits.txt >&2; exit 1; fi
+    # A user certificate for alice, valid for an hour.
+    ssh-keygen -q -t ed25519 -N '' -C ca -f ca
+    ssh-keygen -q -s ca -I id -n alice -V +1h id_ed25519.pub
+    ssh-keygen -L -f id_ed25519-cert.pub > cert.txt
+    ca_fp="$(ssh-keygen -l -f ca.pub | cut -d ' ' -f 2)"
+    for line in 'ssh-ed25519-cert-v01@openssh.com user certificate' 'Key ID: "id"' \
+      "Signing CA: ED25519 $ca_fp"; do
+      if ! grep -Fq "$line" cert.txt; then
+        echo "ssh-keygen -L did not print '$line':" >&2
+        cat cert.txt >&2
+        exit 1
+      fi
+    done
+    if ! grep -Eq '^[[:space:]]+alice$' cert.txt; then cat cert.txt >&2; exit 1; fi
+    # Sign a file and check the signature against an allowed_signers file.
+    printf 'release notes\n' > msg
+    ssh-keygen -Y sign -f id_ed25519 -n file msg 2> sign.txt || { cat sign.txt >&2; exit 1; }
+    printf 'alice@example.test %s\n' "$(cut -d ' ' -f 1,2 id_ed25519.pub)" > allowed_signers
+    ssh-keygen -Y verify -f allowed_signers -I alice@example.test -n file -s msg.sig < msg > verify.txt
+    if ! grep -Fq 'Good "file" signature for alice@example.test with ED25519 key' verify.txt; then
+      cat verify.txt >&2
+      exit 1
+    fi
+    printf 'altered\n' > altered
+    if ssh-keygen -Y verify -f allowed_signers -I alice@example.test -n file -s msg.sig < altered > altered.txt 2>&1; then
+      echo "a signature over other data was accepted" >&2
+      exit 1
+    fi
+  - |
+    mkdir agent
+    cd agent || exit 1
+    ssh-keygen -q -t ed25519 -N '' -C agent -f id
+    printf 'signed by the agent\n' > msg
+    # The private key is deleted before signing, so only the agent can sign.
+    ssh-agent -a "$PWD/agent.sock" sh -c \
+      'ssh-add id && ssh-add -l > list.txt && rm id && ssh-keygen -Y sign -f id.pub -n file msg' \
+      2> agent.txt || { cat agent.txt >&2; exit 1; }
+    if ! grep -Fq '(ED25519)' list.txt; then cat list.txt >&2; exit 1; fi
+    if [ -e id ]; then echo "the private key was not deleted" >&2; exit 1; fi
+    printf 'agent %s\n' "$(cut -d ' ' -f 1,2 id.pub)" > allowed_signers
+    ssh-keygen -Y verify -f allowed_signers -I agent -n file -s msg.sig < msg > verify.txt
+    if ! grep -Fq 'Good "file" signature for agent' verify.txt; then cat verify.txt >&2; exit 1; fi
+  - |
+    mkdir -p transfer/src/sub
+    cd transfer || exit 1
+    head -c 300000 /dev/urandom > src/random.bin
+    printf 'small\n' > src/sub/small.txt
+    # fake-ssh stands in for ssh: it ignores its arguments and starts the
+    # image's sftp-server, which sftp and scp then talk to over a pipe.
+    printf '%s\n' '#!/bin/sh' 'exec /usr/local/libexec/openssh/sftp-server' > fake-ssh
+    # rsh.sh runs the command that scp -O sends to the remote side here.
+    cat > rsh.sh <<'EOF'
+    #!/bin/sh
+    while [ "$1" != -- ]; do shift; done
+    exec sh -c "$3"
+    EOF
+    chmod 755 fake-ssh rsh.sh
+    printf '%s\n' 'mkdir sftp' 'put src/random.bin sftp/random.bin' 'get sftp/random.bin got.bin' 'ls -l sftp' > sftp-batch.txt
+    sftp -S ./fake-ssh -b sftp-batch.txt x > sftp.txt
+    cmp src/random.bin sftp/random.bin
+    cmp src/random.bin got.bin
+    if ! grep -q 'random\.bin' sftp.txt; then cat sftp.txt >&2; exit 1; fi
+    scp -S ./fake-ssh src/random.bin x:pushed.bin
+    cmp src/random.bin pushed.bin
+    scp -r -S ./fake-ssh x:src pulled
+    diff -r src pulled
+    scp -O -S ./rsh.sh src/random.bin x:legacy-pushed.bin
+    cmp src/random.bin legacy-pushed.bin
+    scp -O -r -S ./rsh.sh x:src legacy-pulled
+    diff -r src legacy-pulled
+  - |
+    for f in /usr/local/libexec/openssh/bin/* /usr/local/libexec/openssh/sftp-server \
+      /usr/local/libexec/openssh/ssh-pkcs11-helper /usr/local/libexec/openssh/ssh-sk-helper; do
+      ldd "$f" > ldd.txt 2>&1 || { cat ldd.txt >&2; exit 1; }
+      if grep -Eq 'not found|Error loading shared library|Error relocating' ldd.txt; then
+        cat ldd.txt >&2
+        exit 1
+      fi
+    done
+examples:
+  - title: Run a command on a server with a key and known_hosts file from ~/.ssh
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$HOME/.ssh:/ssh:ro" ghcr.io/randomcontainers/openssh-client -i /ssh/id_ed25519 -o UserKnownHostsFile=/ssh/known_hosts deploy@example.com uptime
+  - title: Log in with the keys loaded in your ssh-agent
+    command: docker run --rm -it --user "$(id -u):$(id -g)" -v "$SSH_AUTH_SOCK:/agent.sock" -e SSH_AUTH_SOCK=/agent.sock -v "$HOME/.ssh/known_hosts:/ssh/known_hosts:ro" ghcr.io/randomcontainers/openssh-client -o UserKnownHostsFile=/ssh/known_hosts deploy@example.com
+  - title: Copy a file to a server with scp
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v "$HOME/.ssh:/ssh:ro" --entrypoint scp ghcr.io/randomcontainers/openssh-client -i /ssh/id_ed25519 -o UserKnownHostsFile=/ssh/known_hosts report.pdf deploy@example.com:/srv/reports/
+  - title: Create an Ed25519 key pair in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint ssh-keygen ghcr.io/randomcontainers/openssh-client -t ed25519 -N "" -C deploy -f deploy_key
