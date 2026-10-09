@@ -12,13 +12,13 @@ upstream:
   tag-pattern: '^V_(\d+)_(\d+)_P(\d+)$'
   version-template: '{1}.{2}p{3}'
   versioning: loose
-  version: "10.5p1"
+  version: "10.6p1"
   # Most releases fix security issues, and the tarball is published with the tag.
   cooldown: 2h
   artifact:
     url: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-{version}.tar.gz
     signature: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-{version}.tar.gz.asc
-    sha256: d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11
+    sha256: a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39
 image:
   entrypoint: [ssh]
   cmd: [-V]
